@@ -1,0 +1,17 @@
+# datasets
+dataset/
+
+# images
+*.png
+*.jpg
+*.jpeg
+
+# python cache
+__pycache__/
+*.pyc
+
+# mac
+.DS_Store
+
+# virtual env
+venv/dataset/
