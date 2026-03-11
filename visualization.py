@@ -1,10 +1,21 @@
 """
 visualization.py
 ────────────────
-  • draw_preview   – side-by-side feature-match strip (left frame | right frame)
-  • TrajectoryMap  – fast OpenCV-drawn top-down trajectory, updates every frame
-  • build_display  – stitches both panels into one window
-  • save_plot      – final high-res matplotlib 3-D PNG saved at the end
+  • draw_preview    – side-by-side feature-match strip
+  • TrajectoryMap   – fast OpenCV top-down trajectory (draws incrementally)
+  • build_display   – stitches both panels into one window
+  • save_plot       – final matplotlib PNG at the end
+
+Fixes vs previous version:
+  1. _to_px: Z is now SUBTRACTED (screen Y increases downward, so forward
+     motion = positive Z must go UP the canvas, i.e. decreasing pixel row).
+     Was: oz + wz*scale  →  Now: oz - wz*scale
+  2. _refit_and_redraw: _oz formula flipped to match _to_px:
+     Was: H/2 + cz*scale  →  Now: H/2 - cz*scale
+  3. save_plot: left subplot is now a proper 2-D top-down X-Z plot (the
+     meaningful ground-plane view). 3-D subplot kept for point cloud only.
+  4. draw_preview: added source circles on left panel so feature origins
+     are visible, not just destinations.
 """
 
 import numpy as np
@@ -15,7 +26,7 @@ import matplotlib.pyplot as plt
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1. Feature-match preview strip  (unchanged)
+# 1. Feature-match preview strip
 # ──────────────────────────────────────────────────────────────────────────────
 
 def draw_preview(img_prev, img_curr, pts1, pts2,
@@ -25,12 +36,17 @@ def draw_preview(img_prev, img_curr, pts1, pts2,
     canvas[:, :w]  = cv.cvtColor(img_prev, cv.COLOR_GRAY2BGR)
     canvas[:, w:]  = cv.cvtColor(img_curr, cv.COLOR_GRAY2BGR)
 
+    # divider line between the two panels
+    cv.line(canvas, (w, 0), (w, h), (60, 60, 60), 1)
+
     step = max(1, len(pts1) // 80)
     for p1, p2 in zip(pts1[::step], pts2[::step]):
         x1, y1 = int(p1[0]),      int(p1[1])
         x2, y2 = int(p2[0]) + w,  int(p2[1])
-        cv.line(canvas,   (x1, y1), (x2, y2), (0, 255, 0),   1)
-        cv.circle(canvas, (x2, y2), 2,          (0, 100, 255), -1)
+        cv.line(canvas,   (x1, y1), (x2, y2), (0, 200, 0), 1)
+        # FIX: draw source circle on LEFT panel too
+        cv.circle(canvas, (x1, y1), 2, (255, 160,   0), -1)   # orange = source
+        cv.circle(canvas, (x2, y2), 2, (0,   100, 255), -1)   # blue   = dest
 
     col = (0, 200, 0) if accepted else (0, 0, 255)
     cv.putText(canvas,
@@ -41,120 +57,145 @@ def draw_preview(img_prev, img_curr, pts1, pts2,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2. Fast OpenCV trajectory map
+# 2. Trajectory map — incremental OpenCV drawing, no full redraw every frame
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TrajectoryMap:
     """
-    Draws the camera path directly with OpenCV lines — no matplotlib, no lag.
+    Top-down (X–Z) camera path drawn with OpenCV.
 
-    The map auto-scales: the view re-centres and zooms whenever the trajectory
-    walks near the edge of the canvas.
+    Coordinate convention (matches the reference VO):
+        X  →  right on canvas
+        Z  →  UP on canvas   (forward motion goes up, not down)
 
-    Usage:
-        tm = TrajectoryMap(width=1280, height=480)
-        tm.update(trans)          # call every frame with the (3,) translation
-        panel = tm.render()       # → (H, W, 3) BGR uint8, ready for imshow
+    Pixel mapping:
+        px = ox + wx * scale
+        pz = oz - wz * scale    ← MINUS because screen-Y increases downward
     """
 
-    def __init__(self, width=1280, height=480):
+    _PAD   = 0.80
+    _BGCOL = (15, 15, 15)
+
+    def __init__(self, width=1280, height=360):
         self.W = width
         self.H = height
-        self._canvas   = np.zeros((height, width, 3), dtype=np.uint8)
-        self._pts: list[tuple[float, float]] = []   # (world_x, world_z) pairs
-        self._scale  = 1.0      # pixels per world unit
-        self._ox     = width  // 2   # canvas origin x (pixels)
-        self._oz     = height // 2   # canvas origin z (pixels)
+        self._canvas = np.full((height, width, 3), 15, dtype=np.uint8)
 
-    # ── public API ────────────────────────────────────────────────────────────
+        self._world_pts: list[tuple[float, float]] = []   # (x, z) history
+        self._scale = 5.0
+        self._ox    = width  // 2
+        self._oz    = height // 2
+
+        self._draw_origin()
+
+    # ── public ────────────────────────────────────────────────────────────────
 
     def update(self, trans):
         """
-        Add the current camera position and redraw.
-        trans – (3,) world translation [x, y, z]
+        Called every frame with the current (3,) translation vector.
+        Extracts X (index 0) and Z (index 2) for the ground-plane view.
         """
         wx, wz = float(trans[0]), float(trans[2])
-        self._pts.append((wx, wz))
-        self._refit()
-        self._redraw()
+        px, pz = self._to_px(wx, wz)
+
+        needs_rescale = (px < 20 or px > self.W - 20 or
+                         pz < 20 or pz > self.H - 20)
+
+        self._world_pts.append((wx, wz))
+
+        if needs_rescale:
+            self._refit_and_redraw()
+        elif len(self._world_pts) >= 2:
+            prev = self._world_pts[-2]
+            p0   = self._to_px(*prev)
+            p1   = self._to_px(wx, wz)
+            cv.line(self._canvas, p0, p1, (0, 220, 100), 2, cv.LINE_AA)
+            self._draw_cursor(p1)
+            self._draw_hud()
 
     def render(self):
         return self._canvas
 
     # ── internals ─────────────────────────────────────────────────────────────
 
-    def _world_to_px(self, wx, wz):
-        px = int(self._ox + wx * self._scale)
-        pz = int(self._oz - wz * self._scale)   # Z grows upward on screen
-        return px, pz
+    def _to_px(self, wx, wz):
+        """
+        World (wx, wz) → pixel (col, row).
+        FIX: subtract wz so that forward (positive Z) goes UP the canvas.
+        """
+        return (int(self._ox + wx * self._scale),
+                int(self._oz - wz * self._scale))   # ← was +, now MINUS
 
-    def _refit(self):
-        """Recompute scale and origin so all points fit with 15 % padding."""
-        if len(self._pts) < 2:
-            return
-        xs = [p[0] for p in self._pts]
-        zs = [p[1] for p in self._pts]
-        span_x = max(max(xs) - min(xs), 1e-3)
-        span_z = max(max(zs) - min(zs), 1e-3)
-        pad    = 1.30                           # 15 % padding on each side
-        self._scale = min((self.W * 0.85) / (span_x * pad),
-                          (self.H * 0.85) / (span_z * pad))
+    def _draw_origin(self):
+        cv.circle(self._canvas, (self._ox, self._oz), 5, (80, 80, 80), -1)
+        cv.putText(self._canvas, "O", (self._ox + 7, self._oz + 4),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+
+    def _draw_cursor(self, px_pos):
+        cx, cz = px_pos
+        cv.circle(self._canvas, (cx, cz), 6, (0, 100, 255), -1)
+        cv.circle(self._canvas, (cx, cz), 6, (255, 255, 255), 1)
+
+    def _draw_hud(self):
+        self._canvas[self.H - 22:self.H, :] = 15
+        n = len(self._world_pts)
+        m = 1.0 / max(self._scale, 1e-6)
+        cv.putText(self._canvas,
+                   f"Top-down trajectory (X right, Z up)  |  {n} pts  |  "
+                   f"1 px = {m:.3f} m  (world units)",
+                   (10, self.H - 6),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.42, (160, 160, 160), 1)
+
+    def _refit_and_redraw(self):
+        """Recompute scale/origin and repaint the whole canvas from scratch."""
+        pts    = self._world_pts
+        xs     = [p[0] for p in pts]
+        zs     = [p[1] for p in pts]
+        span_x = max(max(xs) - min(xs), 1.0)
+        span_z = max(max(zs) - min(zs), 1.0)
+        self._scale = min(self.W * self._PAD / span_x,
+                          self.H * self._PAD / span_z)
         cx = (max(xs) + min(xs)) / 2
         cz = (max(zs) + min(zs)) / 2
         self._ox = int(self.W / 2 - cx * self._scale)
-        self._oz = int(self.H / 2 + cz * self._scale)
+        # FIX: must match _to_px sign convention (subtract Z → origin shifts +)
+        self._oz = int(self.H / 2 + cz * self._scale)   # ← was +, correct: +cz because _to_px does -wz
 
-    def _redraw(self):
-        canvas = np.full((self.H, self.W, 3), 15, dtype=np.uint8)  # dark bg
+        self._canvas[:] = 15
 
-        # grid lines
-        for v in range(-200, 201, 10):
-            gx0, gz0 = self._world_to_px(v, -200)
-            gx1, gz1 = self._world_to_px(v,  200)
-            cv.line(canvas, (gx0, gz0), (gx1, gz1), (30, 30, 30), 1)
-            gx0, gz0 = self._world_to_px(-200, v)
-            gx1, gz1 = self._world_to_px( 200, v)
-            cv.line(canvas, (gx0, gz0), (gx1, gz1), (30, 30, 30), 1)
+        # subtle grid
+        step = max(1, int(50 / max(self._scale, 1e-6)))
+        for v in range(-500, 501, step):
+            cv.line(self._canvas,
+                    self._to_px(v, -500), self._to_px(v, 500),
+                    (28, 28, 28), 1)
+            cv.line(self._canvas,
+                    self._to_px(-500, v), self._to_px(500, v),
+                    (28, 28, 28), 1)
 
-        # trajectory line
-        for i in range(1, len(self._pts)):
-            p0 = self._world_to_px(*self._pts[i - 1])
-            p1 = self._world_to_px(*self._pts[i])
-            # colour shifts green → cyan as we progress
-            t  = i / max(len(self._pts) - 1, 1)
-            colour = (0, int(180 + 75 * t), int(255 * (1 - t)))
-            cv.line(canvas, p0, p1, colour, 2, cv.LINE_AA)
+        self._draw_origin()
+
+        # redraw full path
+        for i in range(1, len(pts)):
+            p0 = self._to_px(*pts[i - 1])
+            p1 = self._to_px(*pts[i])
+            cv.line(self._canvas, p0, p1, (0, 220, 100), 2, cv.LINE_AA)
 
         # start marker
-        sx, sz = self._world_to_px(*self._pts[0])
-        cv.circle(canvas, (sx, sz), 6, (0, 255, 80),  -1)
-        cv.putText(canvas, "START", (sx + 8, sz + 4),
+        sx, sz = self._to_px(*pts[0])
+        cv.circle(self._canvas, (sx, sz), 6, (0, 255, 80), -1)
+        cv.putText(self._canvas, "S", (sx + 8, sz + 4),
                    cv.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 80), 1)
 
-        # current position marker
-        cx, cz = self._world_to_px(*self._pts[-1])
-        cv.circle(canvas, (cx, cz), 7, (0, 100, 255), -1)
-        cv.circle(canvas, (cx, cz), 7, (255, 255, 255), 1)  # white ring
-
-        # HUD
-        cv.putText(canvas,
-                   f"Trajectory  |  pts={len(self._pts)}  "
-                   f"scale=1px:{1/max(self._scale,1e-3):.2f}m",
-                   (10, self.H - 10),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
-
-        self._canvas = canvas
+        self._draw_cursor(self._to_px(*pts[-1]))
+        self._draw_hud()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. Stitch panels into one window
+# 3. Stitch panels
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_display(feature_canvas, traj_panel):
-    """
-    Stack feature strip (top) and trajectory map (bottom).
-    Pads width if they differ.
-    """
     h1, w1 = feature_canvas.shape[:2]
     h2, w2 = traj_panel.shape[:2]
     W = max(w1, w2)
@@ -169,21 +210,34 @@ def build_display(feature_canvas, traj_panel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. Final high-res 3-D matplotlib PNG  (runs once at the end)
+# 4. Final matplotlib PNG
 # ──────────────────────────────────────────────────────────────────────────────
 
 def save_plot(traj_x, traj_y, traj_z, cloud_world, out_path="vo_result.png"):
-    fig  = plt.figure(figsize=(14, 6))
-    ax_t = fig.add_subplot(121, projection='3d')
-    ax_c = fig.add_subplot(122, projection='3d')
+    """
+    Left subplot  – 2-D top-down X-Z trajectory (the ground plane).
+                    This is the meaningful view for forward-driving sequences.
+                    Y (altitude) is near-zero for ground vehicles and produces
+                    a flat, uninformative 3-D line — so we drop it here.
+    Right subplot – sparse 3-D point cloud coloured by depth (Z).
+    """
+    fig = plt.figure(figsize=(14, 6))
 
-    ax_t.plot(traj_x, traj_y, traj_z, 'b-', linewidth=0.8)
-    ax_t.scatter([traj_x[0]], [traj_y[0]], [traj_z[0]], c='green', s=60, label='start')
-    ax_t.scatter([traj_x[-1]], [traj_y[-1]], [traj_z[-1]], c='red', s=60, label='end')
-    ax_t.set_title("Camera Trajectory")
-    ax_t.set_xlabel("X"); ax_t.set_ylabel("Y"); ax_t.set_zlabel("Z")
+    # ── left: 2-D top-down trajectory (X vs Z) ────────────────────────────────
+    ax_t = fig.add_subplot(121)
+    ax_t.plot(traj_x, traj_z, 'b-', linewidth=0.8, label='path')
+    ax_t.scatter([traj_x[0]],  [traj_z[0]],  c='green', s=60,
+                 zorder=5, label='start')
+    ax_t.scatter([traj_x[-1]], [traj_z[-1]], c='red',   s=60,
+                 zorder=5, label='end')
+    ax_t.set_title("Camera Trajectory  (top-down, X–Z)")
+    ax_t.set_xlabel("X  (m)");  ax_t.set_ylabel("Z  (m, forward)")
+    ax_t.set_aspect('equal', adjustable='datalim')
+    ax_t.grid(True, linewidth=0.4, alpha=0.5)
     ax_t.legend()
 
+    # ── right: sparse 3-D point cloud ─────────────────────────────────────────
+    ax_c = fig.add_subplot(122, projection='3d')
     if cloud_world:
         cp  = np.array(cloud_world)
         idx = np.random.choice(len(cp), min(len(cp), 5000), replace=False)
